@@ -1,9 +1,0 @@
-[package]
-name = "fits-viewer"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-fitsio = "0.21.8"
-image = "0.25.8"
-minifb = "0.28.0"
