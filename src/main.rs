@@ -1,623 +1,878 @@
+use colorgrad::Gradient;
+use eframe::egui;
+use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, Ui, Vec2};
 use fitsio::FitsFile;
-use minifb::{Key, Window, WindowOptions};
+use serde::{Deserialize, Serialize};
 
-// Función simple para dibujar un pixel en el buffer
-fn draw_pixel(buffer: &mut [u32], x: usize, y: usize, width: usize, color: u32) {
-    if x < width && y * width + x < buffer.len() {
-        buffer[y * width + x] = color;
-    }
-}
-
-// Función para dibujar un rectángulo (para el fondo del texto)
-fn draw_rect(buffer: &mut [u32], x: usize, y: usize, w: usize, h: usize, width: usize, color: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            draw_pixel(buffer, x + dx, y + dy, width, color);
-        }
-    }
-}
-
-// Función para dibujar texto simple (solo números básicos)
-fn draw_char(buffer: &mut [u32], ch: char, x: usize, y: usize, width: usize, color: u32) {
-    // Patrones simples de 5x7 píxeles para algunos caracteres
-    let patterns: &[u8] = match ch {
-        '0' => &[
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        '1' => &[
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => &[
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => &[
-            0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
-        ],
-        '4' => &[
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => &[
-            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
-        ],
-        '6' => &[
-            0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => &[
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => &[
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => &[
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
-        ],
-        '.' => &[
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
-        ],
-        '-' => &[
-            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
-        ],
-        ':' => &[
-            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
-        ],
-        ' ' => &[
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
-        ],
-        'x' => &[
-            0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000,
-        ],
-        '°' => &[
-            0b01110, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000, 0b00000,
-        ],
-        _ => &[
-            0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111,
-        ], // Cuadrado para chars desconocidos
-    };
-
-    for (row, &pattern) in patterns.iter().enumerate() {
-        for col in 0..5 {
-            if (pattern >> (4 - col)) & 1 == 1 {
-                draw_pixel(buffer, x + col, y + row, width, color);
-            }
-        }
-    }
-}
-
-// Función para dibujar una cadena de texto
-fn draw_text(buffer: &mut [u32], text: &str, x: usize, y: usize, width: usize, color: u32) {
-    for (i, ch) in text.chars().enumerate() {
-        draw_char(buffer, ch, x + i * 6, y, width, color);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum BackgroundColor {
-    Black,
-    Gray,
-    White,
-}
-
-#[derive(Clone, Copy)]
-enum ProcessingMode {
-    Linear,
-    HistogramEqualized,
-    PowerLaw,
-    LogScale,
-}
-
-impl ProcessingMode {
-    fn next(self) -> Self {
-        match self {
-            ProcessingMode::Linear => ProcessingMode::HistogramEqualized,
-            ProcessingMode::HistogramEqualized => ProcessingMode::PowerLaw,
-            ProcessingMode::PowerLaw => ProcessingMode::LogScale,
-            ProcessingMode::LogScale => ProcessingMode::Linear,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            ProcessingMode::Linear => "Lineal",
-            ProcessingMode::HistogramEqualized => "Ecualizado",
-            ProcessingMode::PowerLaw => "Gamma",
-            ProcessingMode::LogScale => "Logarítmico",
-        }
-    }
-}
-
-impl BackgroundColor {
-    fn next(self) -> Self {
-        match self {
-            BackgroundColor::Black => BackgroundColor::Gray,
-            BackgroundColor::Gray => BackgroundColor::White,
-            BackgroundColor::White => BackgroundColor::Black,
-        }
-    }
-
-    fn to_rgb(self) -> u32 {
-        match self {
-            BackgroundColor::Black => 0x000000,
-            BackgroundColor::Gray => 0x808080,
-            BackgroundColor::White => 0xFFFFFF,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            BackgroundColor::Black => "negro",
-            BackgroundColor::Gray => "gris",
-            BackgroundColor::White => "blanco",
-        }
-    }
-}
-
-// Obtiene las coordenadas rotadas
-fn get_rotated_coords(
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    rotation: u8,
-) -> (usize, usize) {
-    match rotation {
-        0 => (x, y),                          // Sin rotación
-        1 => (height - 1 - y, x),             // 90° CW
-        2 => (width - 1 - x, height - 1 - y), // 180°
-        3 => (y, width - 1 - x),              // 270° CW (90° CCW)
-        _ => (x, y),
-    }
-}
-
-// Obtiene las dimensiones después de la rotación
-fn get_rotated_dimensions(width: usize, height: usize, rotation: u8) -> (usize, usize) {
-    match rotation {
-        1 | 3 => (height, width), // 90° o 270°: intercambiar dimensiones
-        _ => (width, height),     // 0° o 180°: mantener dimensiones
-    }
-}
-
-// Función para ecualización de histograma simplificada
-fn histogram_equalize(normalized: f32) -> f32 {
-    // Aplica una función de ecualización que realza el contraste
-    let enhanced = normalized.powf(0.5); // Raíz cuadrada para realzar detalles débiles
-    enhanced.clamp(0.0, 1.0)
-}
-
-// Función para escala logarítmica
-fn log_scale(normalized: f32) -> f32 {
-    if normalized <= 0.0 {
-        0.0
-    } else {
-        (1.0 + normalized * 999.0).ln() / 1000.0_f32.ln()
-    }
-}
-
-// Convierte un valor flotante de FITS a u32 RGB con procesamiento avanzado
-fn grayscale_to_rgb(
-    val: f32,
+// Estructura principal de la aplicación DS9-like
+struct DS9App {
+    // Datos de imagen FITS
+    image_data: Vec<f32>,
+    img_width: usize,
+    img_height: usize,
     min_val: f32,
     max_val: f32,
-    background_color: BackgroundColor,
-    processing_mode: ProcessingMode,
-    brightness: f32,
+
+    // Control de visualización
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    rotation: f32,
+    flip_x: bool,
+    flip_y: bool,
+
+    // Procesamiento de imagen
+    color_map: ColorMap,
+    scaling: ScalingMode,
     contrast: f32,
+    brightness: f32,
     gamma: f32,
-    inverted: bool,
-) -> u32 {
-    // Para datos astronómicos, usar un percentil en lugar del min/max absoluto
-    // Esto ayuda con el rango dinámico extremo típico de FITS
-    let effective_min = min_val;
-    let effective_max = max_val * 0.1; // Usar solo el 10% superior del rango
+    invert: bool,
 
-    // Normalización con rango efectivo
-    let mut normalized = if effective_max > effective_min {
-        ((val - effective_min) / (effective_max - effective_min)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    // Textura para mostrar la imagen
+    texture: Option<TextureHandle>,
 
-    // Aplicar ajustes de brillo y contraste
-    normalized = ((normalized - 0.5) * contrast + 0.5 + brightness).clamp(0.0, 1.0);
+    // Optimización de rendimiento
+    texture_needs_update: bool,
+    last_color_map: ColorMap,
+    last_scaling: ScalingMode,
+    last_contrast: f32,
+    last_brightness: f32,
+    last_gamma: f32,
+    last_invert: bool,
 
-    // Aplicar procesamiento según el modo
-    normalized = match processing_mode {
-        ProcessingMode::Linear => normalized,
-        ProcessingMode::HistogramEqualized => histogram_equalize(normalized),
-        ProcessingMode::PowerLaw => normalized.powf(gamma),
-        ProcessingMode::LogScale => log_scale(normalized),
-    };
+    // Downsampling para mejor rendimiento
+    display_width: usize,
+    display_height: usize,
+    downsample_factor: usize,
 
-    // Invertir si está activado
-    if inverted {
-        normalized = 1.0 - normalized;
-    }
+    // Estado de la interfaz
+    show_info_panel: bool,
+    show_histogram: bool,
+    show_crosshair: bool,
+    show_regions: bool,
+    show_wcs: bool,
 
-    // Detectar fondo real (valores muy negativos o exactamente el mínimo)
-    if val <= min_val + 0.001 {
-        return background_color.to_rgb();
-    }
+    // Regiones de interés
+    regions: Vec<Region>,
+    current_region_type: RegionType,
 
-    let intensity = (normalized * 255.0) as u32;
-    (intensity << 16) | (intensity << 8) | intensity
+    // Cursor y coordenadas
+    cursor_pos: Option<Pos2>,
+    cursor_value: f32,
+    cursor_coords: (f32, f32),
+
+    // Histograma
+    histogram: Vec<u32>,
+    histogram_bins: usize,
+
+    // Archivo actual
+    current_file: String,
+
+    // Control de ventanas
+    window_size: Vec2,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Abre archivo FITS
-    let mut fptr = FitsFile::open("h_m51_b_s05_drz_sci.fits")?;
-    let hdu = fptr.primary_hdu()?;
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum ColorMap {
+    Grayscale,
+    Heat,
+    Cool,
+    Rainbow,
+    Viridis,
+    Plasma,
+    DS9A,
+    DS9B,
+    DS9BB,
+    DS9He,
+}
 
-    // Obtiene dimensiones de la imagen
-    let (img_width, img_height) = match &hdu.info {
-        fitsio::hdu::HduInfo::ImageInfo { shape, .. } => (shape[1], shape[0]),
-        _ => panic!("No es una imagen FITS"),
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum ScalingMode {
+    Linear,
+    Log,
+    Sqrt,
+    Squared,
+    ArcSinh,
+    HistEq,
+    ZScale,
+}
 
-    println!("Dimensiones de la imagen: {}x{}", img_width, img_height);
-    println!("Cargando imagen completa en memoria...");
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum RegionType {
+    Circle,
+    Rectangle,
+    Point,
+    Line,
+    Polygon,
+}
 
-    // Carga toda la imagen en memoria de una sola vez
-    let image_data: Vec<f32> = hdu.read_image(&mut fptr)?;
+#[derive(Debug, Clone, PartialEq)]
+struct Region {
+    region_type: RegionType,
+    center: Pos2,
+    size: Vec2,
+    points: Vec<Pos2>,
+    color: Color32,
+    label: String,
+}
 
-    // Calcula estadísticas de la imagen
-    let mut min_val = f32::MAX;
-    let mut max_val = f32::MIN;
-    let mut sum = 0.0;
-    let mut count_positive = 0;
-    let mut count_zero_or_negative = 0;
+impl ColorMap {
+    fn all() -> Vec<ColorMap> {
+        vec![
+            ColorMap::Grayscale,
+            ColorMap::Heat,
+            ColorMap::Cool,
+            ColorMap::Rainbow,
+            ColorMap::Viridis,
+            ColorMap::Plasma,
+            ColorMap::DS9A,
+            ColorMap::DS9B,
+            ColorMap::DS9BB,
+            ColorMap::DS9He,
+        ]
+    }
 
-    for &v in &image_data {
-        min_val = min_val.min(v);
-        max_val = max_val.max(v);
-        sum += v;
-        if v > 0.0 {
-            count_positive += 1;
-        } else {
-            count_zero_or_negative += 1;
+    fn name(&self) -> &'static str {
+        match self {
+            ColorMap::Grayscale => "Grayscale",
+            ColorMap::Heat => "Heat",
+            ColorMap::Cool => "Cool",
+            ColorMap::Rainbow => "Rainbow",
+            ColorMap::Viridis => "Viridis",
+            ColorMap::Plasma => "Plasma",
+            ColorMap::DS9A => "DS9 A",
+            ColorMap::DS9B => "DS9 B",
+            ColorMap::DS9BB => "DS9 BB",
+            ColorMap::DS9He => "DS9 He",
         }
     }
 
-    let mean_val = sum / image_data.len() as f32;
-    let range = max_val - min_val;
-
-    println!("Imagen cargada:");
-    println!(
-        "  Min: {:.6}, Max: {:.6}, Rango: {:.6}",
-        min_val, max_val, range
-    );
-    println!("  Media: {:.6}", mean_val);
-    println!(
-        "  Píxeles positivos: {}, Píxeles ≤0: {}",
-        count_positive, count_zero_or_negative
-    );
-
-    // Configuración inicial de la ventana
-    let mut win_width = 800;
-    let mut win_height = 600;
-    let mut window = Window::new(
-        "FITS Viewer - /:Info | M:Modo | H:Auto | I:Invertir | Q/A:Brillo | E/D:Contraste | T/G:Gamma | R:Rotar | Space:Fondo",
-        win_width,
-        win_height,
-        WindowOptions {
-            resize: true,
-            ..WindowOptions::default()
-        },
-    )?;
-
-    // Estado de zoom y desplazamiento
-    let mut zoom: f32 = 1.0;
-    let mut offset_x: f32 = 0.0;
-    let mut offset_y: f32 = 0.0;
-
-    // Estado de rotación (0 = normal, 1 = 90°, 2 = 180°, 3 = 270°)
-    let mut rotation: u8 = 0;
-    let mut r_pressed = false;
-
-    // Buffer de la ventana
-    let mut buffer: Vec<u32> = vec![0; win_width * win_height];
-
-    // Variables para controlar el framerate y movimiento suave
-    let zoom_factor = 1.05;
-    let pan_speed = 20.0;
-
-    // Estado del color de fondo
-    let mut background_color = BackgroundColor::Black;
-    let mut space_pressed = false;
-
-    // Controles de procesamiento de imagen
-    let mut processing_mode = ProcessingMode::Linear;
-    let mut brightness: f32 = 0.0; // -0.5 a 0.5
-    let mut contrast: f32 = 1.0; // 0.1 a 3.0
-    let mut gamma: f32 = 1.0; // 0.1 a 3.0
-    let mut inverted = false;
-
-    // Estados de teclas para evitar repetición
-    let mut m_pressed = false;
-    let mut i_pressed = false;
-    let mut h_pressed = false;
-    let mut question_pressed = false;
-
-    // Estado del overlay de información
-    let mut show_info = false;
-
-    // Variables para seguimiento del mouse
-    let mut mouse_x: usize = 0;
-    let mut mouse_y: usize = 0;
-    let mut mouse_img_x: usize = 0;
-    let mut mouse_img_y: usize = 0;
-    let mut mouse_pixel_val: f32 = 0.0;
-
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Verificar si el tamaño de la ventana cambió
-        let (new_width, new_height) = window.get_size();
-        if new_width != win_width || new_height != win_height {
-            win_width = new_width;
-            win_height = new_height;
-            buffer.resize(win_width * win_height, 0);
-            println!("Ventana redimensionada a: {}x{}", win_width, win_height);
+    fn get_gradient(&self) -> Box<dyn Gradient> {
+        match self {
+            ColorMap::Grayscale => Box::new(colorgrad::preset::greys()),
+            ColorMap::Heat => Box::new(colorgrad::preset::turbo()),
+            ColorMap::Cool => Box::new(colorgrad::preset::cool()),
+            ColorMap::Rainbow => Box::new(colorgrad::preset::rainbow()),
+            ColorMap::Viridis => Box::new(colorgrad::preset::viridis()),
+            ColorMap::Plasma => Box::new(colorgrad::preset::plasma()),
+            ColorMap::DS9A => Box::new(colorgrad::preset::inferno()),
+            ColorMap::DS9B => Box::new(colorgrad::preset::magma()),
+            ColorMap::DS9BB => Box::new(colorgrad::preset::plasma()),
+            ColorMap::DS9He => Box::new(colorgrad::preset::cividis()),
         }
+    }
+}
 
-        // Obtener posición del mouse
-        if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
-            mouse_x = mx as usize;
-            mouse_y = my as usize;
+impl ScalingMode {
+    fn all() -> Vec<ScalingMode> {
+        vec![
+            ScalingMode::Linear,
+            ScalingMode::Log,
+            ScalingMode::Sqrt,
+            ScalingMode::Squared,
+            ScalingMode::ArcSinh,
+            ScalingMode::HistEq,
+            ScalingMode::ZScale,
+        ]
+    }
 
-            // Convertir coordenadas de pantalla a coordenadas de imagen
-            let img_x_f = (mouse_x as f32 / zoom + offset_x).max(0.0);
-            let img_y_f = (mouse_y as f32 / zoom + offset_y).max(0.0);
-
-            // Obtener dimensiones considerando rotación
-            let (current_img_width, current_img_height) =
-                get_rotated_dimensions(img_width, img_height, rotation);
-
-            // Coordenadas en la imagen rotada
-            let rotated_x = img_x_f as usize;
-            let rotated_y = img_y_f as usize;
-
-            if rotated_x < current_img_width && rotated_y < current_img_height {
-                // Convertir a coordenadas originales
-                let (orig_x, orig_y) = get_rotated_coords(
-                    rotated_x,
-                    rotated_y,
-                    current_img_width,
-                    current_img_height,
-                    rotation,
-                );
-
-                if orig_x < img_width && orig_y < img_height {
-                    mouse_img_x = orig_x;
-                    mouse_img_y = orig_y;
-                    let pixel_index = orig_y * img_width + orig_x;
-                    mouse_pixel_val = image_data[pixel_index];
-                }
-            }
+    fn name(&self) -> &'static str {
+        match self {
+            ScalingMode::Linear => "Linear",
+            ScalingMode::Log => "Log",
+            ScalingMode::Sqrt => "Sqrt",
+            ScalingMode::Squared => "Squared",
+            ScalingMode::ArcSinh => "ArcSinh",
+            ScalingMode::HistEq => "Hist Eq",
+            ScalingMode::ZScale => "ZScale",
         }
+    }
 
-        // Obtener dimensiones actuales considerando la rotación
-        let (current_img_width, current_img_height) =
-            get_rotated_dimensions(img_width, img_height, rotation);
+    fn apply(&self, value: f32, min_val: f32, max_val: f32) -> f32 {
+        let normalized = ((value - min_val) / (max_val - min_val)).clamp(0.0, 1.0);
 
-        // Manejo de teclas para zoom y pan con movimiento más suave
-        if window.is_key_down(Key::Up) {
-            offset_y = (offset_y - pan_speed / zoom).max(0.0);
-        }
-        if window.is_key_down(Key::Down) {
-            offset_y = (offset_y + pan_speed / zoom)
-                .min((current_img_height as f32 - win_height as f32 / zoom).max(0.0));
-        }
-        if window.is_key_down(Key::Left) {
-            offset_x = (offset_x - pan_speed / zoom).max(0.0);
-        }
-        if window.is_key_down(Key::Right) {
-            offset_x = (offset_x + pan_speed / zoom)
-                .min((current_img_width as f32 - win_width as f32 / zoom).max(0.0));
-        }
-        if window.is_key_down(Key::W) {
-            zoom *= zoom_factor;
-        }
-        if window.is_key_down(Key::S) {
-            zoom = (zoom / zoom_factor).max(0.1);
-        }
-
-        // Manejo de la tecla R para rotar
-        if window.is_key_down(Key::R) {
-            if !r_pressed {
-                rotation = (rotation + 1) % 4;
-                let angle = rotation as u16 * 90;
-                println!("Imagen rotada {}°", angle);
-                // Ajustar offsets después de la rotación para mantener la vista centrada
-                offset_x = 0.0;
-                offset_y = 0.0;
-                r_pressed = true;
-            }
-        } else {
-            r_pressed = false;
-        }
-
-        // Manejo de la tecla espacio para cambiar el fondo
-        if window.is_key_down(Key::Space) {
-            if !space_pressed {
-                background_color = background_color.next();
-                println!("Fondo cambiado a: {}", background_color.name());
-                space_pressed = true;
-            }
-        } else {
-            space_pressed = false;
-        }
-
-        // Manejo de teclas para procesamiento de imagen
-        if window.is_key_down(Key::M) {
-            if !m_pressed {
-                processing_mode = processing_mode.next();
-                println!("Modo de procesamiento: {}", processing_mode.name());
-                m_pressed = true;
-            }
-        } else {
-            m_pressed = false;
-        }
-
-        // Tecla I para invertir colores
-        if window.is_key_down(Key::I) {
-            if !i_pressed {
-                inverted = !inverted;
-                println!("Colores invertidos: {}", if inverted { "Sí" } else { "No" });
-                i_pressed = true;
-            }
-        } else {
-            i_pressed = false;
-        }
-
-        // Tecla H para auto-stretch (realce automático)
-        if window.is_key_down(Key::H) {
-            if !h_pressed {
-                // Resetear valores para auto-stretch
-                brightness = 0.0;
-                contrast = 2.0; // Aumentar contraste automáticamente
-                gamma = 0.7; // Gamma más bajo para realzar detalles
-                println!(
-                    "Auto-realce aplicado (Contraste: {:.1}, Gamma: {:.1})",
-                    contrast, gamma
-                );
-                h_pressed = true;
-            }
-        } else {
-            h_pressed = false;
-        }
-
-        // Controles de brillo con Q/A
-        if window.is_key_down(Key::Q) {
-            brightness = (brightness + 0.01).min(0.5);
-        }
-        if window.is_key_down(Key::A) {
-            brightness = (brightness - 0.01).max(-0.5);
-        }
-
-        // Controles de contraste con E/D
-        if window.is_key_down(Key::E) {
-            contrast = (contrast + 0.05).min(3.0);
-        }
-        if window.is_key_down(Key::D) {
-            contrast = (contrast - 0.05).max(0.1);
-        }
-
-        // Controles de gamma con T/G
-        if window.is_key_down(Key::T) {
-            gamma = (gamma + 0.05).min(3.0);
-        }
-        if window.is_key_down(Key::G) {
-            gamma = (gamma - 0.05).max(0.1);
-        }
-
-        // Tecla / para mostrar/ocultar información
-        if window.is_key_down(Key::Enter) {
-            if !question_pressed {
-                show_info = !show_info;
-                println!(
-                    "Overlay de información: {}",
-                    if show_info { "Activado" } else { "Desactivado" }
-                );
-                question_pressed = true;
-            }
-        } else {
-            question_pressed = false;
-        }
-
-        // Renderizado optimizado con soporte para rotación
-        for y in 0..win_height {
-            for x in 0..win_width {
-                // Calcular coordenadas en la imagen rotada
-                let rotated_x = ((x as f32 / zoom + offset_x) as usize)
-                    .min(current_img_width.saturating_sub(1));
-                let rotated_y = ((y as f32 / zoom + offset_y) as usize)
-                    .min(current_img_height.saturating_sub(1));
-
-                // Convertir a coordenadas originales de la imagen
-                let (orig_x, orig_y) = get_rotated_coords(
-                    rotated_x,
-                    rotated_y,
-                    current_img_width,
-                    current_img_height,
-                    rotation,
-                );
-
-                // Verificar que las coordenadas estén dentro de los límites
-                if orig_x < img_width && orig_y < img_height {
-                    let pixel_index = orig_y * img_width + orig_x;
-                    let pixel_val = image_data[pixel_index];
-                    buffer[y * win_width + x] = grayscale_to_rgb(
-                        pixel_val,
-                        min_val,
-                        max_val,
-                        background_color,
-                        processing_mode,
-                        brightness,
-                        contrast,
-                        gamma,
-                        inverted,
-                    );
+        match self {
+            ScalingMode::Linear => normalized,
+            ScalingMode::Log => {
+                if normalized <= 0.0 {
+                    0.0
                 } else {
-                    // Pixel fuera de los límites - usar color de fondo
-                    buffer[y * win_width + x] = background_color.to_rgb();
+                    (1.0 + normalized * 999.0).ln() / 1000.0_f32.ln()
                 }
+            }
+            ScalingMode::Sqrt => normalized.sqrt(),
+            ScalingMode::Squared => normalized * normalized,
+            ScalingMode::ArcSinh => {
+                let scaled = normalized * 10.0;
+                scaled.asinh() / 10.0_f32.asinh()
+            }
+            ScalingMode::HistEq => normalized.powf(0.5), // Simplified histogram equalization
+            ScalingMode::ZScale => {
+                // Simplified ZScale - in real implementation would use statistics
+                let z1 = 0.1;
+                let z2 = 0.9;
+                ((normalized - z1) / (z2 - z1)).clamp(0.0, 1.0)
+            }
+        }
+    }
+}
+
+impl Default for DS9App {
+    fn default() -> Self {
+        Self {
+            image_data: Vec::new(),
+            img_width: 0,
+            img_height: 0,
+            min_val: 0.0,
+            max_val: 1.0,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            color_map: ColorMap::Grayscale,
+            scaling: ScalingMode::Linear,
+            contrast: 1.0,
+            brightness: 0.0,
+            gamma: 1.0,
+            invert: false,
+            texture: None,
+            texture_needs_update: true,
+            last_color_map: ColorMap::Grayscale,
+            last_scaling: ScalingMode::Linear,
+            last_contrast: 1.0,
+            last_brightness: 0.0,
+            last_gamma: 1.0,
+            last_invert: false,
+            display_width: 0,
+            display_height: 0,
+            downsample_factor: 1,
+            show_info_panel: true,
+            show_histogram: false,
+            show_crosshair: false,
+            show_regions: true,
+            show_wcs: false,
+            regions: Vec::new(),
+            current_region_type: RegionType::Circle,
+            cursor_pos: None,
+            cursor_value: 0.0,
+            cursor_coords: (0.0, 0.0),
+            histogram: Vec::new(),
+            histogram_bins: 256,
+            current_file: String::new(),
+            window_size: Vec2::new(1200.0, 800.0),
+        }
+    }
+}
+
+impl DS9App {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+
+        // Intentar cargar una imagen FITS por defecto
+        if let Ok(_) = app.load_fits_file("h_m51_b_s05_drz_sci.fits") {
+            println!("Imagen FITS cargada exitosamente");
+        }
+
+        app
+    }
+
+    fn load_fits_file(&mut self, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut fptr = FitsFile::open(filename)?;
+        let hdu = fptr.primary_hdu()?;
+
+        // Obtener dimensiones
+        let (width, height) = match &hdu.info {
+            fitsio::hdu::HduInfo::ImageInfo { shape, .. } => (shape[1], shape[0]),
+            _ => return Err("No es una imagen FITS válida".into()),
+        };
+
+        // Cargar datos
+        let data: Vec<f32> = hdu.read_image(&mut fptr)?;
+
+        // Calcular estadísticas
+        let mut min_val = f32::MAX;
+        let mut max_val = f32::MIN;
+
+        for &val in &data {
+            if val.is_finite() {
+                min_val = min_val.min(val);
+                max_val = max_val.max(val);
             }
         }
 
-        // Renderizar overlay de información si está activado
-        if show_info {
-            // Verificar que tenemos espacio para el overlay
-            if win_width > 320 && win_height > 270 {
-                // Fondo oscuro sólido para el texto (gris oscuro) - más grande
-                draw_rect(&mut buffer, 10, 10, 300, 250, win_width, 0x202020);
+        // Calcular factor de downsampling para imágenes grandes
+        let max_display_size = 2048; // Máximo tamaño de display
+        self.downsample_factor = if width > max_display_size || height > max_display_size {
+            ((width.max(height) as f32 / max_display_size as f32).ceil() as usize).max(1)
+        } else {
+            1
+        };
 
-                // Marco para mejor visibilidad
-                draw_rect(&mut buffer, 8, 8, 304, 1, win_width, 0xFFFFFF); // Top
-                draw_rect(&mut buffer, 8, 259, 304, 1, win_width, 0xFFFFFF); // Bottom
-                draw_rect(&mut buffer, 8, 8, 1, 252, win_width, 0xFFFFFF); // Left
-                draw_rect(&mut buffer, 311, 8, 1, 252, win_width, 0xFFFFFF); // Right
+        // Asegurar que las dimensiones de display sean válidas
+        self.display_width = (width + self.downsample_factor - 1) / self.downsample_factor; // División con redondeo hacia arriba
+        self.display_height = (height + self.downsample_factor - 1) / self.downsample_factor;
 
-                // Información simplificada usando solo números
-                let info_values = vec![
-                    format!("{:.2}", zoom),
-                    format!("{:.0} {:.0}", offset_x, offset_y),
-                    format!("{}", processing_mode.name()),
-                    format!("{}", background_color.name()),
-                    format!("{:.2}", brightness),
-                    format!("{:.2}", contrast),
-                    format!("{:.2}", gamma),
-                    format!("{}", if inverted { "1" } else { "0" }),
-                    format!("{}°", rotation as u16 * 90),
-                    format!("{}x{}", win_width, win_height),
-                    format!("{}x{}", img_width, img_height),
-                    format!("{:.1} {:.1}", min_val, max_val),
-                    format!("{} {}", mouse_x, mouse_y),
-                    format!("{} {}", mouse_img_x, mouse_img_y),
-                    format!("{:.2}", mouse_pixel_val),
-                ];
+        // Actualizar estado de la aplicación
+        self.image_data = data;
+        self.img_width = width;
+        self.img_height = height;
+        self.min_val = min_val;
+        self.max_val = max_val;
+        self.current_file = filename.to_string();
+        self.texture_needs_update = true;
 
-                // Dibujar cada línea de información con solo números y símbolos
-                for (i, value) in info_values.iter().enumerate() {
-                    if i < 15 {
-                        // Limitar a 12 líneas
-                        // Filtrar solo caracteres que podemos dibujar
-                        let simple_value = value
-                            .chars()
-                            .filter(|&c| matches!(c, '0'..='9' | '.' | '-' | ':' | ' ' | 'x' | '°'))
-                            .collect::<String>();
+        // Calcular histograma (usando muestreo para mejor rendimiento)
+        self.calculate_histogram();
 
-                        draw_text(
-                            &mut buffer,
-                            &simple_value,
-                            15,
-                            15 + i * 15,
-                            win_width,
-                            0x00FF00, // Verde brillante
-                        );
+        // Resetear vista
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+
+        println!(
+            "Imagen cargada: {}x{} (display: {}x{}), rango: {:.3} - {:.3}, downsample: {}x",
+            width,
+            height,
+            self.display_width,
+            self.display_height,
+            min_val,
+            max_val,
+            self.downsample_factor
+        );
+
+        Ok(())
+    }
+
+    fn calculate_histogram(&mut self) {
+        self.histogram = vec![0; self.histogram_bins];
+
+        // Muestrear cada N píxeles para mejor rendimiento en imágenes grandes
+        let sample_step = if self.image_data.len() > 1_000_000 {
+            10
+        } else {
+            1
+        };
+
+        for (i, &val) in self.image_data.iter().enumerate() {
+            if i % sample_step != 0 {
+                continue;
+            }
+
+            if val.is_finite() && val >= self.min_val && val <= self.max_val {
+                let normalized = (val - self.min_val) / (self.max_val - self.min_val);
+                let bin = ((normalized * (self.histogram_bins as f32 - 1.0)) as usize)
+                    .min(self.histogram_bins - 1);
+                self.histogram[bin] += sample_step as u32; // Compensar el muestreo
+            }
+        }
+    }
+
+    fn needs_texture_update(&self) -> bool {
+        self.texture_needs_update
+            || self.color_map != self.last_color_map
+            || self.scaling != self.last_scaling
+            || (self.contrast - self.last_contrast).abs() > 0.01
+            || (self.brightness - self.last_brightness).abs() > 0.01
+            || (self.gamma - self.last_gamma).abs() > 0.01
+            || self.invert != self.last_invert
+    }
+
+    fn create_texture(&mut self, ctx: &egui::Context) {
+        if self.image_data.is_empty() || !self.needs_texture_update() {
+            return;
+        }
+
+        let mut color_data = Vec::with_capacity(self.display_width * self.display_height * 4);
+        let gradient = self.color_map.get_gradient();
+
+        // Usar downsampling para mejor rendimiento
+        let ds = self.downsample_factor;
+
+        // Asegurar que el tamaño calculado sea correcto
+        let expected_pixels = self.display_width * self.display_height;
+        color_data.reserve_exact(expected_pixels * 4);
+
+        for dy in 0..self.display_height {
+            for dx in 0..self.display_width {
+                let y = dy * ds;
+                let x = dx * ds;
+
+                if y >= self.img_height || x >= self.img_width {
+                    // Pixel fuera de límites - usar negro
+                    color_data.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                }
+
+                let idx = y * self.img_width + x;
+                if idx >= self.image_data.len() {
+                    // Índice fuera de límites - usar negro
+                    color_data.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                }
+
+                let val = self.image_data[idx];
+                let mut processed_val = if val.is_finite() {
+                    self.scaling.apply(val, self.min_val, self.max_val)
+                } else {
+                    0.0
+                };
+
+                // Aplicar ajustes
+                processed_val =
+                    ((processed_val - 0.5) * self.contrast + 0.5 + self.brightness).clamp(0.0, 1.0);
+                processed_val = processed_val.powf(self.gamma);
+
+                if self.invert {
+                    processed_val = 1.0 - processed_val;
+                }
+
+                let color = gradient.at(processed_val);
+                color_data.push((color.r as f32 * 255.0) as u8);
+                color_data.push((color.g as f32 * 255.0) as u8);
+                color_data.push((color.b as f32 * 255.0) as u8);
+                color_data.push(255);
+            }
+        }
+
+        let color_image = ColorImage::from_rgba_unmultiplied(
+            [self.display_width, self.display_height],
+            &color_data,
+        );
+
+        self.texture = Some(ctx.load_texture("fits_image", color_image, Default::default()));
+
+        // Actualizar cache
+        self.texture_needs_update = false;
+        self.last_color_map = self.color_map;
+        self.last_scaling = self.scaling;
+        self.last_contrast = self.contrast;
+        self.last_brightness = self.brightness;
+        self.last_gamma = self.gamma;
+        self.last_invert = self.invert;
+    }
+
+    fn menu_bar(&mut self, ui: &mut Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open FITS...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("FITS files", &["fits", "fit", "fts"])
+                        .pick_file()
+                    {
+                        if let Some(path_str) = path.to_str() {
+                            let _ = self.load_fits_file(path_str);
+                        }
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Save Image...").clicked() {
+                    // TODO: Implementar guardado
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    std::process::exit(0);
+                }
+            });
+
+            ui.menu_button("View", |ui| {
+                ui.checkbox(&mut self.show_info_panel, "Info Panel");
+                ui.checkbox(&mut self.show_histogram, "Histogram");
+                ui.checkbox(&mut self.show_crosshair, "Crosshair");
+                ui.checkbox(&mut self.show_regions, "Regions");
+                ui.checkbox(&mut self.show_wcs, "WCS Coordinates");
+                ui.separator();
+                if ui.button("Zoom to Fit").clicked() {
+                    self.zoom = 1.0;
+                    self.pan_x = 0.0;
+                    self.pan_y = 0.0;
+                    ui.close_menu();
+                }
+                if ui.button("Zoom 1:1").clicked() {
+                    self.zoom = 1.0;
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Scale", |ui| {
+                for scale in ScalingMode::all() {
+                    if ui
+                        .selectable_label(self.scaling == scale, scale.name())
+                        .clicked()
+                    {
+                        self.scaling = scale;
+                        self.texture_needs_update = true;
+                        ui.close_menu();
+                    }
+                }
+            });
+
+            ui.menu_button("Color", |ui| {
+                for cmap in ColorMap::all() {
+                    if ui
+                        .selectable_label(self.color_map == cmap, cmap.name())
+                        .clicked()
+                    {
+                        self.color_map = cmap;
+                        self.texture_needs_update = true;
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.checkbox(&mut self.invert, "Invert").changed() {
+                    self.texture_needs_update = true;
+                }
+            });
+
+            ui.menu_button("Region", |ui| {
+                ui.selectable_value(&mut self.current_region_type, RegionType::Circle, "Circle");
+                ui.selectable_value(
+                    &mut self.current_region_type,
+                    RegionType::Rectangle,
+                    "Rectangle",
+                );
+                ui.selectable_value(&mut self.current_region_type, RegionType::Point, "Point");
+                ui.selectable_value(&mut self.current_region_type, RegionType::Line, "Line");
+                ui.separator();
+                if ui.button("Clear All Regions").clicked() {
+                    self.regions.clear();
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    fn side_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_info_panel {
+            return;
+        }
+
+        egui::SidePanel::right("info_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.heading("Image Info");
+
+                ui.separator();
+
+                // Información de archivo
+                ui.label(format!("File: {}", self.current_file));
+                ui.label(format!("Size: {}×{}", self.img_width, self.img_height));
+                ui.label(format!("Range: {:.3} to {:.3}", self.min_val, self.max_val));
+
+                ui.separator();
+
+                // Controles de visualización
+                ui.heading("Display");
+
+                ui.horizontal(|ui| {
+                    ui.label("Zoom:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.zoom)
+                            .range(0.1..=10.0)
+                            .speed(0.1),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Pan X:");
+                    ui.add(egui::DragValue::new(&mut self.pan_x).speed(1.0));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Pan Y:");
+                    ui.add(egui::DragValue::new(&mut self.pan_y).speed(1.0));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Rotation:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.rotation)
+                            .range(0.0..=360.0)
+                            .speed(1.0),
+                    );
+                });
+
+                ui.checkbox(&mut self.flip_x, "Flip X");
+                ui.checkbox(&mut self.flip_y, "Flip Y");
+
+                ui.separator();
+
+                // Controles de imagen
+                ui.heading("Image Processing");
+
+                ui.horizontal(|ui| {
+                    ui.label("Brightness:");
+                    let response =
+                        ui.add(egui::Slider::new(&mut self.brightness, -0.5..=0.5).step_by(0.01));
+                    if response.changed() {
+                        self.texture_needs_update = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Contrast:");
+                    let response =
+                        ui.add(egui::Slider::new(&mut self.contrast, 0.1..=3.0).step_by(0.1));
+                    if response.changed() {
+                        self.texture_needs_update = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Gamma:");
+                    let response =
+                        ui.add(egui::Slider::new(&mut self.gamma, 0.1..=3.0).step_by(0.1));
+                    if response.changed() {
+                        self.texture_needs_update = true;
+                    }
+                });
+                ui.separator();
+
+                // Información del cursor
+                ui.heading("Cursor Info");
+
+                if let Some(pos) = self.cursor_pos {
+                    ui.label(format!("Screen: ({:.0}, {:.0})", pos.x, pos.y));
+                    ui.label(format!(
+                        "Image: ({:.1}, {:.1})",
+                        self.cursor_coords.0, self.cursor_coords.1
+                    ));
+                    ui.label(format!("Value: {:.3}", self.cursor_value));
+                } else {
+                    ui.label("No cursor position");
+                }
+
+                ui.separator();
+
+                // Estadísticas de regiones
+                if !self.regions.is_empty() {
+                    ui.heading(format!("Regions ({})", self.regions.len()));
+
+                    for (i, region) in self.regions.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}: {:?}", i + 1, region.region_type));
+                            if ui.small_button("×").clicked() {
+                                // TODO: Eliminar región
+                            }
+                        });
+                    }
+                }
+            });
+    }
+
+    fn histogram_window(&mut self, ctx: &egui::Context) {
+        if !self.show_histogram {
+            return;
+        }
+
+        egui::Window::new("Histogram")
+            .resizable(true)
+            .default_size([400.0, 300.0])
+            .show(ctx, |ui| {
+                ui.label("Histogram (simplified view)");
+                ui.separator();
+
+                // Simple text-based histogram display
+                let max_count = self.histogram.iter().max().unwrap_or(&1);
+                for (i, &count) in self.histogram.iter().enumerate().take(32) {
+                    let bar_length = (count as f32 / *max_count as f32 * 20.0) as usize;
+                    let bar = "█".repeat(bar_length);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{:3}", i));
+                        ui.label(bar);
+                        ui.label(format!("{}", count));
+                    });
+                }
+            });
+    }
+
+    fn image_viewer(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.image_data.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No FITS image loaded. Use File > Open FITS... to load an image.");
+                });
+                return;
+            }
+
+            // Crear textura si es necesario
+            if self.texture.is_none() {
+                self.create_texture(ctx);
+            }
+
+            let available_size = ui.available_size();
+            let response = ui.allocate_response(available_size, egui::Sense::click_and_drag());
+
+            if let Some(texture) = &self.texture {
+                let image_size = Vec2::new(
+                    self.img_width as f32 * self.zoom,
+                    self.img_height as f32 * self.zoom,
+                );
+
+                let center = response.rect.center();
+                let image_rect =
+                    Rect::from_center_size(center + Vec2::new(self.pan_x, self.pan_y), image_size);
+
+                // Dibujar imagen
+                ui.painter().image(
+                    texture.id(),
+                    image_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+
+                // Manejar interacciones del mouse
+                if response.hovered() {
+                    if let Some(hover_pos) = response.hover_pos() {
+                        self.cursor_pos = Some(hover_pos);
+
+                        // Convertir coordenadas de pantalla a imagen
+                        let rel_pos = hover_pos - image_rect.min;
+                        let img_x = (rel_pos.x / self.zoom) as usize;
+                        let img_y = (rel_pos.y / self.zoom) as usize;
+
+                        if img_x < self.img_width && img_y < self.img_height {
+                            let idx = img_y * self.img_width + img_x;
+                            self.cursor_coords = (img_x as f32, img_y as f32);
+                            self.cursor_value = self.image_data[idx];
+                        }
+
+                        // Dibujar crosshair
+                        if self.show_crosshair {
+                            let painter = ui.painter();
+                            painter.line_segment(
+                                [
+                                    Pos2::new(hover_pos.x, response.rect.min.y),
+                                    Pos2::new(hover_pos.x, response.rect.max.y),
+                                ],
+                                Stroke::new(1.0, Color32::RED),
+                            );
+                            painter.line_segment(
+                                [
+                                    Pos2::new(response.rect.min.x, hover_pos.y),
+                                    Pos2::new(response.rect.max.x, hover_pos.y),
+                                ],
+                                Stroke::new(1.0, Color32::RED),
+                            );
+                        }
+                    }
+                }
+
+                // Manejar zoom con rueda del mouse
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                    if scroll != 0.0 {
+                        let zoom_factor = 1.1;
+                        if scroll > 0.0 {
+                            self.zoom *= zoom_factor;
+                        } else {
+                            self.zoom /= zoom_factor;
+                        }
+                        self.zoom = self.zoom.clamp(0.1, 10.0);
+                    }
+                }
+
+                // Manejar arrastre para pan
+                if response.dragged() {
+                    self.pan_x += response.drag_delta().x;
+                    self.pan_y += response.drag_delta().y;
+                }
+
+                // Dibujar regiones
+                if self.show_regions {
+                    let painter = ui.painter();
+                    for region in &self.regions {
+                        match region.region_type {
+                            RegionType::Circle => {
+                                painter.circle_stroke(
+                                    region.center,
+                                    region.size.x,
+                                    Stroke::new(2.0, region.color),
+                                );
+                            }
+                            RegionType::Rectangle => {
+                                painter.rect_stroke(
+                                    Rect::from_center_size(region.center, region.size),
+                                    0.0,
+                                    Stroke::new(2.0, region.color),
+                                );
+                            }
+                            RegionType::Point => {
+                                painter.circle_filled(region.center, 3.0, region.color);
+                            }
+                            _ => {} // TODO: Implementar otros tipos
+                        }
                     }
                 }
             }
-        }
 
-        window.update_with_buffer(&buffer, win_width, win_height)?;
+            // Manejar teclas
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::Space) {
+                    self.zoom = 1.0;
+                    self.pan_x = 0.0;
+                    self.pan_y = 0.0;
+                }
+
+                if i.key_pressed(egui::Key::R) {
+                    self.rotation += 90.0;
+                    if self.rotation >= 360.0 {
+                        self.rotation = 0.0;
+                    }
+                }
+
+                if i.key_pressed(egui::Key::X) {
+                    self.flip_x = !self.flip_x;
+                }
+
+                if i.key_pressed(egui::Key::Y) {
+                    self.flip_y = !self.flip_y;
+                }
+
+                if i.key_pressed(egui::Key::I) {
+                    self.invert = !self.invert;
+                }
+            });
+        });
     }
+}
 
-    Ok(())
+impl eframe::App for DS9App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Solo recrear textura si es necesario (gran optimización de rendimiento)
+        self.create_texture(ctx);
+
+        // Limitar framerate para mejor rendimiento
+        ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60 FPS
+
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            self.menu_bar(ui);
+        });
+
+        self.side_panel(ctx);
+        if self.show_histogram {
+            self.histogram_window(ctx);
+        }
+        self.image_viewer(ctx);
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_title("DS9-like FITS Viewer")
+            .with_resizable(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "DS9-like FITS Viewer",
+        options,
+        Box::new(|cc| Ok(Box::new(DS9App::new(cc)))),
+    )
 }

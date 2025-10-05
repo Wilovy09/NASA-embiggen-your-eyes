@@ -6,4 +6,10 @@ edition = "2024"
 [dependencies]
 fitsio = "0.21.8"
 image = "0.25.8"
-minifb = "0.28.0"
+egui = "0.28"
+eframe = "0.28"
+epaint = "0.28"
+colorgrad = "0.7"
+num-traits = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+rfd = "0.15"
