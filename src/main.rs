@@ -3,6 +3,8 @@ use eframe::egui;
 use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, Ui, Vec2};
 use fitsio::FitsFile;
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc;
+use tokio::runtime::Runtime;
 
 // Estructura principal de la aplicación DS9-like
 struct DS9App {
@@ -56,6 +58,8 @@ struct DS9App {
     // Regiones de interés
     regions: Vec<Region>,
     current_region_type: RegionType,
+    creating_region: bool,
+    region_start_pos: Option<Pos2>,
 
     // Cursor y coordenadas
     cursor_pos: Option<Pos2>,
@@ -71,6 +75,16 @@ struct DS9App {
 
     // Control de ventanas
     window_size: Vec2,
+
+    // Chatbot con Gemini
+    show_chatbot: bool,
+    chat_messages: Vec<ChatMessage>,
+    chat_input: String,
+    gemini_api_key: String,
+    is_processing: bool,
+    runtime: Option<Runtime>,
+    chat_receiver: Option<mpsc::Receiver<ChatbotMessage>>,
+    chat_sender: Option<mpsc::Sender<ChatbotMessage>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -98,13 +112,12 @@ enum ScalingMode {
     ZScale,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum RegionType {
     Circle,
     Rectangle,
     Point,
     Line,
-    Polygon,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +128,68 @@ struct Region {
     points: Vec<Pos2>,
     color: Color32,
     label: String,
+}
+
+// Estructuras para el chatbot con Gemini
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: String, // "user" o "model"
+    content: String,
+    timestamp: std::time::Instant,
+}
+
+#[derive(Serialize)]
+struct GeminiRequest {
+    contents: Vec<GeminiContent>,
+}
+
+#[derive(Serialize)]
+struct GeminiContent {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum GeminiPart {
+    Text { text: String },
+    Image { inline_data: InlineData },
+}
+
+#[derive(Serialize)]
+struct InlineData {
+    mime_type: String,
+    data: String, // base64 encoded
+}
+
+#[derive(Deserialize)]
+struct GeminiResponse {
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: GeminiResponseContent,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponseContent {
+    parts: Vec<GeminiResponsePart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponsePart {
+    text: String,
+}
+
+#[derive(Debug)]
+enum ChatbotMessage {
+    SendMessage {
+        message: String,
+        include_image: bool,
+        include_regions: bool,
+    },
+    Response(String),
+    Error(String),
 }
 
 impl ColorMap {
@@ -256,6 +331,8 @@ impl Default for DS9App {
             show_wcs: false,
             regions: Vec::new(),
             current_region_type: RegionType::Circle,
+            creating_region: false,
+            region_start_pos: None,
             cursor_pos: None,
             cursor_value: 0.0,
             cursor_coords: (0.0, 0.0),
@@ -263,6 +340,14 @@ impl Default for DS9App {
             histogram_bins: 256,
             current_file: String::new(),
             window_size: Vec2::new(1200.0, 800.0),
+            show_chatbot: false,
+            chat_messages: Vec::new(),
+            chat_input: String::new(),
+            gemini_api_key: std::env::var("GEMINI_API_KEY").unwrap_or_default().to_string(),
+            is_processing: false,
+            runtime: None,
+            chat_receiver: None,
+            chat_sender: None,
         }
     }
 }
@@ -270,6 +355,12 @@ impl Default for DS9App {
 impl DS9App {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
+
+        // Inicializar el runtime de tokio y el canal de comunicación
+        app.runtime = Some(Runtime::new().expect("Failed to create tokio runtime"));
+        let (sender, receiver) = mpsc::channel();
+        app.chat_sender = Some(sender);
+        app.chat_receiver = Some(receiver);
 
         // Intentar cargar una imagen FITS por defecto
         if let Ok(_) = app.load_fits_file("h_m51_b_s05_drz_sci.fits") {
@@ -468,8 +559,21 @@ impl DS9App {
                     }
                     ui.close_menu();
                 }
-                if ui.button("Save Image...").clicked() {
-                    // TODO: Implementar guardado
+                if ui.button("Export as PNG...").clicked() {
+                    if self.image_data.is_empty() {
+                        eprintln!("No image loaded to export");
+                    } else {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG files", &["png"])
+                            .set_file_name("exported_image.png")
+                            .save_file()
+                        {
+                            match self.export_png(&path) {
+                                Ok(_) => println!("Image exported successfully to: {:?}", path),
+                                Err(e) => eprintln!("Error exporting PNG: {}", e),
+                            }
+                        }
+                    }
                     ui.close_menu();
                 }
                 ui.separator();
@@ -484,6 +588,7 @@ impl DS9App {
                 ui.checkbox(&mut self.show_crosshair, "Crosshair");
                 ui.checkbox(&mut self.show_regions, "Regions");
                 ui.checkbox(&mut self.show_wcs, "WCS Coordinates");
+                ui.checkbox(&mut self.show_chatbot, "AI Chatbot");
                 ui.separator();
                 if ui.button("Zoom to Fit").clicked() {
                     self.zoom = 1.0;
@@ -649,17 +754,63 @@ impl DS9App {
                 ui.separator();
 
                 // Estadísticas de regiones
-                if !self.regions.is_empty() {
-                    ui.heading(format!("Regions ({})", self.regions.len()));
+                ui.heading("Regions");
 
+                ui.horizontal(|ui| {
+                    ui.label("Current tool:");
+                    ui.label(format!("{:?}", self.current_region_type));
+                });
+
+                ui.separator();
+
+                ui.label("Instructions:");
+                match self.current_region_type {
+                    RegionType::Point => ui.label("Ctrl+Click to place point"),
+                    RegionType::Circle | RegionType::Rectangle => {
+                        if self.creating_region {
+                            ui.colored_label(Color32::YELLOW, "Click again to finish shape")
+                        } else {
+                            ui.label("Ctrl+Click to start, then click to finish")
+                        }
+                    }
+                    _ => ui.label("Select from Regions menu"),
+                };
+
+                ui.separator();
+
+                if !self.regions.is_empty() {
+                    ui.label(format!("Active regions ({})", self.regions.len()));
+
+                    let mut to_remove = None;
                     for (i, region) in self.regions.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            ui.label(format!("{}: {:?}", i + 1, region.region_type));
-                            if ui.small_button("×").clicked() {
-                                // TODO: Eliminar región
-                            }
+                            let color_rect =
+                                Rect::from_min_size(ui.cursor().min, Vec2::new(15.0, 15.0));
+                            ui.painter().rect_filled(color_rect, 2.0, region.color);
+                            ui.allocate_space(Vec2::new(20.0, 15.0));
+
+                            ui.label(&region.label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                },
+                            );
                         });
                     }
+
+                    if let Some(index) = to_remove {
+                        self.regions.remove(index);
+                    }
+
+                    if ui.button("Clear All").clicked() {
+                        self.regions.clear();
+                    }
+                } else {
+                    ui.label("No regions created");
+                    ui.label("Use Ctrl+Click in the image");
                 }
             });
     }
@@ -776,6 +927,109 @@ impl DS9App {
                     }
                 }
 
+                // Manejar creación de regiones con el mouse
+                if response.clicked() {
+                    if let Some(click_pos) = response.interact_pointer_pos() {
+                        if ui.input(|i| i.modifiers.ctrl) {
+                            // Ctrl+Click para crear regiones
+                            match self.current_region_type {
+                                RegionType::Point => {
+                                    // Crear punto inmediatamente
+                                    let region = Region {
+                                        region_type: RegionType::Point,
+                                        center: click_pos,
+                                        size: Vec2::new(3.0, 3.0),
+                                        points: vec![click_pos],
+                                        color: Color32::from_rgb(255, 255, 0), // Amarillo
+                                        label: format!("Point {}", self.regions.len() + 1),
+                                    };
+                                    self.regions.push(region);
+                                }
+                                RegionType::Circle | RegionType::Rectangle => {
+                                    if !self.creating_region {
+                                        // Iniciar creación
+                                        self.creating_region = true;
+                                        self.region_start_pos = Some(click_pos);
+                                    } else {
+                                        // Finalizar creación
+                                        if let Some(start_pos) = self.region_start_pos {
+                                            let center = Pos2::new(
+                                                (start_pos.x + click_pos.x) / 2.0,
+                                                (start_pos.y + click_pos.y) / 2.0,
+                                            );
+                                            let size = Vec2::new(
+                                                (click_pos.x - start_pos.x).abs(),
+                                                (click_pos.y - start_pos.y).abs(),
+                                            );
+
+                                            let region = Region {
+                                                region_type: self.current_region_type,
+                                                center,
+                                                size: if self.current_region_type
+                                                    == RegionType::Circle
+                                                {
+                                                    Vec2::new(
+                                                        size.x.max(size.y) / 2.0,
+                                                        size.x.max(size.y) / 2.0,
+                                                    )
+                                                } else {
+                                                    size
+                                                },
+                                                points: vec![start_pos, click_pos],
+                                                color: Color32::from_rgb(0, 255, 255), // Cian
+                                                label: format!(
+                                                    "{:?} {}",
+                                                    self.current_region_type,
+                                                    self.regions.len() + 1
+                                                ),
+                                            };
+                                            self.regions.push(region);
+                                        }
+                                        self.creating_region = false;
+                                        self.region_start_pos = None;
+                                    }
+                                }
+                                _ => {} // Otros tipos por implementar
+                            }
+                        }
+                    }
+                }
+
+                // Dibujar región en proceso de creación
+                if self.creating_region {
+                    if let Some(start_pos) = self.region_start_pos {
+                        if let Some(current_pos) = response.hover_pos() {
+                            let painter = ui.painter();
+                            match self.current_region_type {
+                                RegionType::Rectangle => {
+                                    let rect = Rect::from_two_pos(start_pos, current_pos);
+                                    painter.rect_stroke(
+                                        rect,
+                                        0.0,
+                                        Stroke::new(2.0, Color32::from_rgb(255, 255, 0)),
+                                    );
+                                }
+                                RegionType::Circle => {
+                                    let center = Pos2::new(
+                                        (start_pos.x + current_pos.x) / 2.0,
+                                        (start_pos.y + current_pos.y) / 2.0,
+                                    );
+                                    let radius = ((current_pos.x - start_pos.x).powi(2)
+                                        + (current_pos.y - start_pos.y).powi(2))
+                                    .sqrt()
+                                        / 2.0;
+                                    painter.circle_stroke(
+                                        center,
+                                        radius,
+                                        Stroke::new(2.0, Color32::from_rgb(255, 255, 0)),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
                 // Manejar arrastre para pan
                 if response.dragged() {
                     self.pan_x += response.drag_delta().x;
@@ -839,6 +1093,377 @@ impl DS9App {
             });
         });
     }
+
+    fn export_png(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        if self.image_data.is_empty() {
+            return Err("No image data to export".into());
+        }
+
+        // Usar los valores min/max ya calculados
+        let min_val = self.min_val;
+        let max_val = self.max_val;
+
+        // Aplicar escalado y contraste/brillo
+        let mut scaled_data = Vec::with_capacity(self.image_data.len());
+        for &value in &self.image_data {
+            let scaled = self.scaling.apply(value, min_val, max_val);
+            let adjusted = (scaled + self.brightness) * (1.0 + self.contrast);
+            scaled_data.push(adjusted.clamp(0.0, 1.0));
+        }
+
+        // Obtener el gradiente de color actual
+        let gradient = self.color_map.get_gradient();
+
+        // Crear buffer RGB
+        let mut rgb_data = Vec::with_capacity(self.img_width * self.img_height * 3);
+
+        for &value in &scaled_data {
+            let color = gradient.at(value);
+            rgb_data.push((color.r * 255.0) as u8);
+            rgb_data.push((color.g * 255.0) as u8);
+            rgb_data.push((color.b * 255.0) as u8);
+        }
+
+        // Crear imagen
+        let img =
+            image::RgbImage::from_raw(self.img_width as u32, self.img_height as u32, rgb_data)
+                .ok_or("Failed to create image from raw data")?;
+
+        // Aplicar transformaciones si están habilitadas
+        let final_img = if self.flip_x || self.flip_y {
+            let mut processed = image::DynamicImage::ImageRgb8(img);
+
+            if self.flip_x {
+                processed = processed.fliph();
+            }
+            if self.flip_y {
+                processed = processed.flipv();
+            }
+
+            processed.to_rgb8()
+        } else {
+            img
+        };
+
+        final_img.save(path)?;
+        Ok(())
+    }
+
+    fn send_to_gemini(&mut self, message: String, include_image: bool, include_regions: bool) {
+        if let (Some(sender), Some(runtime)) = (&self.chat_sender, &self.runtime) {
+            let sender = sender.clone();
+            let api_key = self.gemini_api_key.clone();
+
+            // Preparar contexto de imagen si se solicita
+            let image_data = if include_image && !self.image_data.is_empty() {
+                Some(self.create_image_for_gemini())
+            } else {
+                None
+            };
+
+            // Preparar contexto de regiones si se solicita
+            let regions_context = if include_regions && !self.regions.is_empty() {
+                Some(self.create_regions_context())
+            } else {
+                None
+            };
+
+            runtime.spawn(async move {
+                let result =
+                    Self::call_gemini_api(api_key, message, image_data, regions_context).await;
+                let response = match result {
+                    Ok(response) => ChatbotMessage::Response(response),
+                    Err(e) => ChatbotMessage::Error(format!("Error: {}", e)),
+                };
+                let _ = sender.send(response);
+            });
+        }
+    }
+
+    fn create_image_for_gemini(&self) -> String {
+        // Crear una versión pequeña de la imagen para enviar a Gemini
+        let scale_factor = 4; // Reducir tamaño para API
+        let small_width = self.img_width / scale_factor;
+        let small_height = self.img_height / scale_factor;
+
+        let mut small_image_data = Vec::new();
+        for y in 0..small_height {
+            for x in 0..small_width {
+                let orig_x = x * scale_factor;
+                let orig_y = y * scale_factor;
+                if orig_x < self.img_width && orig_y < self.img_height {
+                    let idx = orig_y * self.img_width + orig_x;
+                    small_image_data.push(self.image_data[idx]);
+                }
+            }
+        }
+
+        // Convertir a imagen RGB
+        let min_val = self.min_val;
+        let max_val = self.max_val;
+        let gradient = self.color_map.get_gradient();
+
+        let mut rgb_data = Vec::new();
+        for &value in &small_image_data {
+            let scaled = self.scaling.apply(value, min_val, max_val);
+            let adjusted = (scaled + self.brightness) * (1.0 + self.contrast);
+            let normalized = adjusted.clamp(0.0, 1.0);
+            let color = gradient.at(normalized);
+
+            rgb_data.push((color.r * 255.0) as u8);
+            rgb_data.push((color.g * 255.0) as u8);
+            rgb_data.push((color.b * 255.0) as u8);
+        }
+
+        // Crear imagen PNG en memoria y codificar en base64
+        if let Some(img) =
+            image::RgbImage::from_raw(small_width as u32, small_height as u32, rgb_data)
+        {
+            let dynamic_img = image::DynamicImage::ImageRgb8(img);
+            let mut png_data = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut png_data);
+            if dynamic_img
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .is_ok()
+            {
+                return base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &png_data,
+                );
+            }
+        }
+
+        String::new()
+    }
+
+    fn create_regions_context(&self) -> String {
+        let mut context = String::from("Current regions in the image:\n");
+        for (i, region) in self.regions.iter().enumerate() {
+            match region.region_type {
+                RegionType::Point => {
+                    context.push_str(&format!(
+                        "{}. Point at ({:.1}, {:.1})\n",
+                        i + 1,
+                        region.center.x,
+                        region.center.y
+                    ));
+                }
+                RegionType::Circle => {
+                    context.push_str(&format!(
+                        "{}. Circle centered at ({:.1}, {:.1}) with radius {:.1}\n",
+                        i + 1,
+                        region.center.x,
+                        region.center.y,
+                        region.size.x
+                    ));
+                }
+                RegionType::Rectangle => {
+                    context.push_str(&format!(
+                        "{}. Rectangle at ({:.1}, {:.1}) with size {:.1}x{:.1}\n",
+                        i + 1,
+                        region.center.x,
+                        region.center.y,
+                        region.size.x,
+                        region.size.y
+                    ));
+                }
+                RegionType::Line => {
+                    if region.points.len() >= 2 {
+                        context.push_str(&format!(
+                            "{}. Line from ({:.1}, {:.1}) to ({:.1}, {:.1})\n",
+                            i + 1,
+                            region.points[0].x,
+                            region.points[0].y,
+                            region.points[1].x,
+                            region.points[1].y
+                        ));
+                    }
+                }
+            }
+        }
+        context
+    }
+
+    async fn call_gemini_api(
+        api_key: String,
+        message: String,
+        image_data: Option<String>,
+        regions_context: Option<String>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+
+        let mut parts = Vec::new();
+
+        // Agregar contexto de regiones si existe
+        if let Some(regions) = regions_context {
+            parts.push(GeminiPart::Text {
+                text: format!("You are analyzing an astronomical FITS image. {}", regions),
+            });
+        }
+
+        // Agregar imagen si existe
+        if let Some(image_b64) = image_data {
+            parts.push(GeminiPart::Image {
+                inline_data: InlineData {
+                    mime_type: "image/png".to_string(),
+                    data: image_b64,
+                },
+            });
+        }
+
+        // Agregar mensaje del usuario
+        parts.push(GeminiPart::Text { text: message });
+
+        let request = GeminiRequest {
+            contents: vec![GeminiContent { parts }],
+        };
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={}",
+            api_key
+        );
+
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(format!("API Error: {}", error_text).into());
+        }
+
+        let gemini_response: GeminiResponse = response.json().await?;
+
+        if let Some(candidate) = gemini_response.candidates.first() {
+            if let Some(part) = candidate.content.parts.first() {
+                return Ok(part.text.clone());
+            }
+        }
+
+        Err("No response from Gemini".into())
+    }
+
+    fn chatbot_window(&mut self, ctx: &egui::Context) {
+        if !self.show_chatbot {
+            return;
+        }
+
+        egui::Window::new("🤖 AI Assistant")
+            .resizable(true)
+            .default_size([400.0, 500.0])
+            .show(ctx, |ui| {
+                ui.heading("Gemini AI - Astronomical Image Analyst");
+                ui.separator();
+
+                // Área de mensajes
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for message in &self.chat_messages {
+                            let color = if message.role == "user" {
+                                Color32::LIGHT_BLUE
+                            } else {
+                                Color32::LIGHT_GREEN
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    color,
+                                    &format!("{}:", message.role.to_uppercase()),
+                                );
+                            });
+                            ui.label(&message.content);
+                            ui.separator();
+                        }
+                    });
+
+                ui.separator();
+
+                // Input de texto
+                ui.horizontal(|ui| {
+                    let response = ui.text_edit_singleline(&mut self.chat_input);
+
+                    let send_button = ui.button("Send");
+
+                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || send_button.clicked()
+                    {
+                        if !self.chat_input.trim().is_empty() && !self.is_processing {
+                            let message = self.chat_input.clone();
+                            self.chat_messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: message.clone(),
+                                timestamp: std::time::Instant::now(),
+                            });
+
+                            // Siempre incluir imagen y regiones si están disponibles
+                            let include_image = !self.image_data.is_empty();
+                            let include_regions = !self.regions.is_empty();
+                            self.send_to_gemini(message, include_image, include_regions);
+                            self.chat_input.clear();
+                            self.is_processing = true;
+                        }
+                    }
+                });
+
+                // Controles de contexto (solo informativo)
+                ui.horizontal(|ui| {
+                    ui.label("Context:");
+                    if !self.image_data.is_empty() {
+                        ui.colored_label(Color32::GREEN, "✓ Image");
+                    } else {
+                        ui.colored_label(Color32::RED, "✗ Image");
+                    }
+                    if !self.regions.is_empty() {
+                        ui.colored_label(
+                            Color32::GREEN,
+                            format!("✓ {} Regions", self.regions.len()),
+                        );
+                    } else {
+                        ui.colored_label(Color32::RED, "✗ Regions");
+                    }
+                });
+
+                if self.is_processing {
+                    ui.spinner();
+                    ui.label("Processing...");
+                }
+
+                // Botón para limpiar chat
+                if ui.button("Clear Chat").clicked() {
+                    self.chat_messages.clear();
+                }
+            });
+    }
+
+    fn process_chat_messages(&mut self) {
+        if let Some(receiver) = &self.chat_receiver {
+            while let Ok(message) = receiver.try_recv() {
+                self.is_processing = false;
+                match message {
+                    ChatbotMessage::Response(text) => {
+                        self.chat_messages.push(ChatMessage {
+                            role: "model".to_string(),
+                            content: text,
+                            timestamp: std::time::Instant::now(),
+                        });
+                    }
+                    ChatbotMessage::Error(error) => {
+                        self.chat_messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: format!("Error: {}", error),
+                            timestamp: std::time::Instant::now(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for DS9App {
@@ -857,6 +1482,10 @@ impl eframe::App for DS9App {
         if self.show_histogram {
             self.histogram_window(ctx);
         }
+        if self.show_chatbot {
+            self.chatbot_window(ctx);
+        }
+        self.process_chat_messages();
         self.image_viewer(ctx);
     }
 }
