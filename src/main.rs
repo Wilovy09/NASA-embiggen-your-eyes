@@ -1,6 +1,6 @@
 use colorgrad::Gradient;
 use eframe::egui;
-use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, Ui, Vec2};
+use egui::{Color32, ColorImage, Pos2, Rect, Stroke, TextureHandle, Ui, Vec2, pos2, vec2};
 use fitsio::FitsFile;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
@@ -343,7 +343,9 @@ impl Default for DS9App {
             show_chatbot: false,
             chat_messages: Vec::new(),
             chat_input: String::new(),
-            gemini_api_key: std::env::var("GEMINI_API_KEY").unwrap_or_default().to_string(),
+            gemini_api_key: std::env::var("GEMINI_API_KEY")
+                .unwrap_or_default()
+                .to_string(),
             is_processing: false,
             runtime: None,
             chat_receiver: None,
@@ -931,6 +933,9 @@ impl DS9App {
                 if response.clicked() {
                     if let Some(click_pos) = response.interact_pointer_pos() {
                         if ui.input(|i| i.modifiers.ctrl) {
+                            let click_pos = click_pos - image_rect.min;
+                            let click_pos = (click_pos * self.zoom).to_pos2();
+
                             // Ctrl+Click para crear regiones
                             match self.current_region_type {
                                 RegionType::Point => {
@@ -962,6 +967,8 @@ impl DS9App {
                                                 (click_pos.y - start_pos.y).abs(),
                                             );
 
+                                            let size = size / self.zoom;
+
                                             let region = Region {
                                                 region_type: self.current_region_type,
                                                 center,
@@ -976,7 +983,7 @@ impl DS9App {
                                                     size
                                                 },
                                                 points: vec![start_pos, click_pos],
-                                                color: Color32::from_rgb(0, 255, 255), // Cian
+                                                color: Color32::from_rgb(0, 255, 255), // Cyan
                                                 label: format!(
                                                     "{:?} {}",
                                                     self.current_region_type,
@@ -1000,6 +1007,8 @@ impl DS9App {
                     if let Some(start_pos) = self.region_start_pos {
                         if let Some(current_pos) = response.hover_pos() {
                             let painter = ui.painter();
+                            let start_pos = start_pos * self.zoom;
+                            let start_pos = start_pos + image_rect.min.to_vec2();
                             match self.current_region_type {
                                 RegionType::Rectangle => {
                                     let rect = Rect::from_two_pos(start_pos, current_pos);
@@ -1039,24 +1048,28 @@ impl DS9App {
                 // Dibujar regiones
                 if self.show_regions {
                     let painter = ui.painter();
+
                     for region in &self.regions {
+                        let center = region.center * self.zoom;
+                        let center = center + image_rect.min.to_vec2();
+
                         match region.region_type {
                             RegionType::Circle => {
                                 painter.circle_stroke(
-                                    region.center,
-                                    region.size.x,
+                                    center,
+                                    region.size.x * self.zoom,
                                     Stroke::new(2.0, region.color),
                                 );
                             }
                             RegionType::Rectangle => {
                                 painter.rect_stroke(
-                                    Rect::from_center_size(region.center, region.size),
+                                    Rect::from_center_size(center, region.size * self.zoom),
                                     0.0,
                                     Stroke::new(2.0, region.color),
                                 );
                             }
                             RegionType::Point => {
-                                painter.circle_filled(region.center, 3.0, region.color);
+                                painter.circle_filled(center, 3.0, region.color);
                             }
                             _ => {} // TODO: Implementar otros tipos
                         }
